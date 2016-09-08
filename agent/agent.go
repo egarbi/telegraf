@@ -107,15 +107,13 @@ func (a *Agent) gatherer(
 	input *models.RunningInput,
 	interval time.Duration,
 	metricC chan telegraf.Metric,
-) error {
+) {
 	defer panicRecover(input)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
-		var outerr error
-
 		acc := NewAccumulator(input.Config, metricC)
 		acc.SetDebug(a.Config.Agent.Debug)
 		acc.SetPrecision(a.Config.Agent.Precision.Duration,
@@ -128,9 +126,6 @@ func (a *Agent) gatherer(
 		gatherWithTimeout(shutdown, input, acc, interval)
 		elapsed := time.Since(start)
 
-		if outerr != nil {
-			return outerr
-		}
 		if a.Config.Agent.Debug {
 			log.Printf("Input [%s] gathered metrics, (%s interval) in %s\n",
 				input.Name, interval, elapsed)
@@ -138,7 +133,7 @@ func (a *Agent) gatherer(
 
 		select {
 		case <-shutdown:
-			return nil
+			return
 		case <-ticker.C:
 			continue
 		}
@@ -259,24 +254,54 @@ func (a *Agent) flusher(shutdown chan struct{}, metricC chan telegraf.Metric) er
 	// the flusher will flush after metrics are collected.
 	time.Sleep(time.Millisecond * 200)
 
-	ticker := time.NewTicker(a.Config.Agent.FlushInterval.Duration)
+	// create an output metric channel and a gorouting that continously passes
+	// each metric onto the output plugins & aggregators.
+	outMetricC := make(chan telegraf.Metric, 100)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-shutdown:
+				// TODO aggregators should get stopped here
+				if len(outMetricC) > 0 {
+					// keep going until outMetricC is flushed
+					continue
+				}
+				return
+			case m := <-outMetricC:
+				// TODO send metrics to aggregators (copy all)
+				for i, o := range a.Config.Outputs {
+					if i == len(a.Config.Outputs)-1 {
+						o.AddMetric(m)
+					} else {
+						o.AddMetric(copyMetric(m))
+					}
+				}
+			}
+		}
+	}()
 
+	ticker := time.NewTicker(a.Config.Agent.FlushInterval.Duration)
 	for {
 		select {
 		case <-shutdown:
 			log.Println("Hang on, flushing any cached metrics before shutdown")
+			// wait for outMetricC to get flushed before flushing outputs
+			wg.Wait()
 			a.flush()
 			return nil
 		case <-ticker.C:
 			internal.RandomSleep(a.Config.Agent.FlushJitter.Duration, shutdown)
 			a.flush()
-		case m := <-metricC:
-			for i, o := range a.Config.Outputs {
-				if i == len(a.Config.Outputs)-1 {
-					o.AddMetric(m)
-				} else {
-					o.AddMetric(copyMetric(m))
-				}
+		case metric := <-metricC:
+			mS := []telegraf.Metric{metric}
+			for _, processor := range a.Config.Processors {
+				mS = processor.Apply(mS...)
+			}
+			for _, m := range mS {
+				outMetricC <- m
 			}
 		}
 	}
@@ -353,9 +378,7 @@ func (a *Agent) Run(shutdown chan struct{}) error {
 		}
 		go func(in *models.RunningInput, interv time.Duration) {
 			defer wg.Done()
-			if err := a.gatherer(shutdown, in, interv, metricC); err != nil {
-				log.Printf(err.Error())
-			}
+			a.gatherer(shutdown, in, interv, metricC)
 		}(input, interval)
 	}
 
